@@ -90,6 +90,13 @@ sub add_field {
 	substr($value, $i, 1) = $ent;
     }
 
+    # SIP2 Protocol document specifies that variable fields are from 0
+    # to 255 characters in length.  We'll do a check of the field
+    # length and truncate if necessary.
+    if (length($value) > 255) {
+        $value = substr($value, 0, 255);
+    }
+
     return $field_id . $value . $field_delimiter;
 }
 #
@@ -234,14 +241,16 @@ sub write_msg {
         $msg .= checksum($msg);
     }
 
+    my $outmsg = "$msg\r";
 
     if ($file) {
-        print $file "$msg\r";
+        print $file $outmsg;
     } else {
-        print "$msg\r";
-        syslog("LOG_INFO", "OUTPUT MSG: '$msg'");
+        my $rv = POSIX::write(fileno(STDOUT), $outmsg, length($outmsg));
+        syslog("LOG_ERR", "Error writing to STDOUT $!") unless $rv;
     }
 
+    syslog("LOG_INFO", "OUTPUT MSG: '$msg'");
     $last_response = $msg;
 }
 

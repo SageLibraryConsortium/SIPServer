@@ -443,7 +443,7 @@ sub handle {
 # information will be returned to the terminal.
 # 
 sub build_patron_status {
-    my ($patron, $lang, $fields)= @_;
+    my ($patron, $lang, $fields, $server)= @_;
     $lang ||= '000';
     my $patron_pwd = $fields->{(FID_PATRON_PWD)};
     my $resp = (PATRON_STATUS_RESP);
@@ -451,17 +451,26 @@ sub build_patron_status {
     if ($patron) {
 	$resp .= patron_status_string($patron);
 	$resp .= $lang . Sip::timestamp();
-	$resp .= add_field(FID_PERSONAL_NAME, $patron->name);
 
 	# while the patron ID we got from the SC is valid, let's
 	# use the one returned from the ILS, just in case...
+	$resp .= add_field(FID_INST_ID, $fields->{(FID_INST_ID)});
 	$resp .= add_field(FID_PATRON_ID, $patron->id);
+	$resp .= add_field(FID_PERSONAL_NAME, $patron->name);
 	if ($protocol_version >= 2) {
 	    $resp .= add_field(FID_VALID_PATRON, 'Y');
 	    # Patron password is a required field.
 		$resp .= add_field(FID_VALID_PATRON_PWD, sipbool($patron->check_password($patron_pwd)));
 	    $resp .= maybe_add(FID_CURRENCY, $patron->currency);
 	    $resp .= maybe_add(FID_FEE_AMT, $patron->fee_amount);
+
+		# Relais extensions
+		if ($server->{institution}->relais_extensions_to_msg24()) {
+			$resp .= maybe_add(FID_HOME_ADDR,  $patron->address   );
+			$resp .= maybe_add(FID_EMAIL,      $patron->email_addr);
+			$resp .= maybe_add(FID_HOME_PHONE, $patron->home_phone);
+		}
+
 	}
 
 	$resp .= maybe_add(FID_SCREEN_MSG, $patron->screen_msg);
@@ -470,18 +479,18 @@ sub build_patron_status {
 	# Invalid patron id.  Report that the user has no privs.,
 	# no personal name, and is invalid (if we're using 2.00)
 	$resp .= 'YYYY' . (' ' x 10) . $lang . Sip::timestamp();
-	$resp .= add_field(FID_PERSONAL_NAME, '');
+	$resp .= add_field(FID_INST_ID, $fields->{(FID_INST_ID)});
 
 	# the patron ID is invalid, but it's a required field, so
 	# just echo it back
 	$resp .= add_field(FID_PATRON_ID, $fields->{(FID_PATRON_ID)});
+	$resp .= add_field(FID_PERSONAL_NAME, '');
 
 	if ($protocol_version >= 2) {
 	    $resp .= add_field(FID_VALID_PATRON, 'N');
 	}
     }
 
-    $resp .= add_field(FID_INST_ID, $fields->{(FID_INST_ID)});
 
     return $resp;
 }
@@ -502,7 +511,7 @@ sub handle_patron_status {
 
     $patron = $ils->find_patron($fields->{(FID_PATRON_ID)});
 
-    $resp = build_patron_status($patron, $lang, $fields);
+    $resp = build_patron_status($patron, $lang, $fields, $server);
 
     $self->write_msg($resp);
 
@@ -593,7 +602,7 @@ sub handle_checkout {
 	# Checkout failed
 	# Checkout Response: not ok, no renewal, don't know mag. media,
 	# no desensitize
-	$resp = sprintf("120NUN%s", Sip::timestamp);
+	$resp = sprintf("120%sUN%s", sipbool($status->renew_ok), Sip::timestamp);
 	$resp .= add_field(FID_INST_ID, $inst);
 	$resp .= add_field(FID_PATRON_ID, $patron_id);
 	$resp .= add_field(FID_ITEM_ID, $item_id);
@@ -745,7 +754,7 @@ sub handle_block_patron {
         $patron->block($card_retained, $blocked_card_msg);
     }
 
-    $resp = build_patron_status($patron, $language, $fields);
+    $resp = build_patron_status($patron, $language, $fields, $server);
 
     $self->write_msg($resp);
     return(BLOCK_PATRON);
@@ -771,15 +780,30 @@ sub handle_sc_status {
 	$protocol_version = $new_proto;
     }
 
-    if ($status == SC_STATUS_PAPER) {
-	syslog("LOG_WARNING", "Self-Check unit '%s@%s' out of paper",
-	       $self->{account}->{id}, $self->{account}->{institution});
-    } elsif ($status == SC_STATUS_SHUTDOWN) {
-	syslog("LOG_WARNING", "Self-Check unit '%s@%s' shutting down",
-	       $self->{account}->{id}, $self->{account}->{institution});
+    unless (defined $server->{account}) {
+        # If we haven't logged in yet, go ahead and
+        # return the SC status anyway, arbitrarily using the
+        # first account in Perl string sort order to specify
+        # the account, institution, and ILS. This supports
+        # raw clients such as Relais that insist on sending 99 first
+        # before 93.
+        syslog('LOG_INFO', 'sending SC status without logging in first');
+        my $mock_server;
+        $mock_server->{config} = $server->{config};
+        my $uid = (sort keys %{ $server->{config}->{accounts} })[0];
+        _load_ils_handler($mock_server, $uid);
+        return send_acs_status($self, $mock_server) ? SC_STATUS : '';
     }
 
-    $self->{account}->{print_width} = $print_width;
+    if ($status == SC_STATUS_PAPER) {
+	syslog("LOG_WARNING", "Self-Check unit '%s@%s' out of paper",
+	       $server->{account}->{id}, $server->{account}->{institution});
+    } elsif ($status == SC_STATUS_SHUTDOWN) {
+	syslog("LOG_WARNING", "Self-Check unit '%s@%s' shutting down",
+	       $server->{account}->{id}, $server->{account}->{institution});
+    }
+
+    $server->{account}->{print_width} = $print_width;
 
     return send_acs_status($self, $server) ? SC_STATUS : '';
 }
@@ -832,37 +856,45 @@ sub handle_login {
         syslog("LOG_WARNING", "MsgType::handle_login: Invalid password for login '$uid'");
         $status = 0;
     } else {
-        # Store the active account someplace handy for everybody else to find.
-        $server->{account}     = $server->{config}->{accounts}->{$uid};
-        $inst                  = $server->{account}->{institution};
-        $server->{institution} = $server->{config}->{institutions}->{$inst};
-        $server->{policy}      = $server->{institution}->{policy};
-
-
-        syslog("LOG_INFO", "Successful login for '%s' of '%s'", $server->{account}->{id}, $inst);
-        #
-        # initialize connection to ILS
-        #
-        my $module = $server->{config}->{institutions}->{$inst}->{implementation};
-        $module->use;
-
-        if ($@) {
-            syslog("LOG_ERR", "%s: Loading ILS implementation '%s' for institution '%s' failed",
-               $server->{service}, $module, $inst);
-            die("Failed to load ILS implementation '$module'");
-        }
-
-        $server->{ils} = $module->new($server->{institution}, $server->{account});
-
-        if (!$server->{ils}) {
-            syslog("LOG_ERR", "%s: ILS connection to '%s' failed", $server->{service}, $inst);
-            die("Unable to connect to ILS '$inst'");
-        }
+        _load_ils_handler($server, $uid);
     }
+
+    $server->{login_complete}->($status) if $server->{login_complete};
 
     $self->write_msg(LOGIN_RESP . $status);
 
     return $status ? LOGIN : '';
+}
+
+sub _load_ils_handler {
+    my ($server, $uid) = @_;
+
+    # Store the active account someplace handy for everybody else to find.
+    $server->{account}     = $server->{config}->{accounts}->{$uid};
+    my $inst               = $server->{account}->{institution};
+    $server->{institution} = $server->{config}->{institutions}->{$inst};
+    $server->{policy}      = $server->{institution}->{policy};
+
+
+    syslog("LOG_INFO", "Successful login for '%s' of '%s'", $server->{account}->{id}, $inst);
+    #
+    # initialize connection to ILS
+    #
+    my $module = $server->{config}->{institutions}->{$inst}->{implementation};
+    $module->use;
+
+    if ($@) {
+        syslog("LOG_ERR", "%s: Loading ILS implementation '%s' for institution '%s' failed",
+           $server->{service}, $module, $inst);
+        die("Failed to load ILS implementation '$module'");
+    }
+
+    $server->{ils} = $module->new($server->{institution}, $server->{account});
+
+    if (!$server->{ils}) {
+        syslog("LOG_ERR", "%s: ILS connection to '%s' failed", $server->{service}, $inst);
+        die("Unable to connect to ILS '$inst'");
+    }
 }
 
 #
@@ -897,6 +929,12 @@ sub summary_info {
         return '';
     }
 
+    if ($summary_type > $#summary_map || not defined $summary_map[$summary_type]->{func}) {
+        # Huh, we don't have any code to handle the requested summary information.
+        # Pretend nothing was asked for instead.
+        return '';
+    }
+
     syslog("LOG_DEBUG", "Summary_info: index == '%d', field '%s'",
 	   $summary_type, $summary_map[$summary_type]->{fid});
 
@@ -919,6 +957,7 @@ sub handle_patron_info {
     my $fields = $self->{fields};
     my ($inst_id, $patron_id, $terminal_pwd, $patron_pwd, $start, $end);
     my ($resp, $patron, $count);
+    $lang ||= '000'; # unspecified
 
     $inst_id      = $fields->{(FID_INST_ID)};
     $patron_id    = $fields->{(FID_PATRON_ID)};
@@ -932,14 +971,18 @@ sub handle_patron_info {
     $resp = (PATRON_INFO_RESP);
     if ($patron) {
         $resp .= patron_status_string($patron);
+
+        $lang = $patron->language if $patron->language;
         $resp .= $lang . Sip::timestamp();
 
-        $resp .= add_count('patron_info/hold_items',    scalar @{$patron->hold_items   });
-        $resp .= add_count('patron_info/overdue_items', scalar @{$patron->overdue_items});
-        $resp .= add_count('patron_info/charged_items', scalar @{$patron->charged_items});
-        $resp .= add_count('patron_info/fine_items',    scalar @{$patron->fine_items   });
-        $resp .= add_count('patron_info/recall_items',  scalar @{$patron->recall_items });
-        $resp .= add_count('patron_info/unavail_holds', scalar @{$patron->unavail_holds});
+        $resp .= add_count('patron_info/hold_items',    scalar @{$patron->hold_items(undef,undef,1)   });
+        $resp .= add_count('patron_info/overdue_items', scalar @{$patron->overdue_items(undef,undef,1)});
+        $resp .= add_count('patron_info/charged_items', scalar @{$patron->charged_items(undef,undef,1)});
+        $resp .= add_count('patron_info/fine_items',    scalar @{$patron->fine_items(undef,undef,1)   });
+        $resp .= add_count('patron_info/recall_items',  scalar @{$patron->recall_items(undef,undef,1) });
+        $resp .= add_count('patron_info/unavail_holds', scalar @{$patron->unavail_holds(undef,undef,1)});
+
+        $resp .= add_field(FID_INST_ID, $server->{ils}->institution);
 
         # while the patron ID we got from the SC is valid, let's
         # use the one returned from the ILS, just in case...
@@ -1006,18 +1049,17 @@ sub handle_patron_info {
         # no personal name, and is invalid (if we're using 2.00)
         $resp .= 'YYYY' . (' ' x 10) . $lang . Sip::timestamp();
         $resp .= '0000' x 6;
-        $resp .= add_field(FID_PERSONAL_NAME, '');
 
+        $resp .= add_field(FID_INST_ID, $server->{ils}->institution);
         # the patron ID is invalid, but it's a required field, so
         # just echo it back
         $resp .= add_field(FID_PATRON_ID, $fields->{(FID_PATRON_ID)});
+        $resp .= add_field(FID_PERSONAL_NAME, '');
 
         if ($protocol_version >= 2) {
             $resp .= add_field(FID_VALID_PATRON, 'N');
         }
     }
-
-    $resp .= add_field(FID_INST_ID, $server->{ils}->institution);
 
     $self->write_msg($resp);
 
@@ -1055,7 +1097,7 @@ sub handle_end_patron_session {
 sub handle_fee_paid {
     my ($self, $server) = @_;
     my $ils = $server->{ils};
-    my ($trans_date, $fee_type, $pay_type, $currency) = $self->{fixed_fields};
+    my ($trans_date, $fee_type, $pay_type, $currency) = @{$self->{fixed_fields}};
     my $fields = $self->{fields};
     my ($fee_amt, $inst_id, $patron_id, $terminal_pwd, $patron_pwd);
     my ($fee_id, $trans_id);

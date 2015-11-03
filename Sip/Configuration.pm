@@ -38,14 +38,14 @@ my $parser = new XML::Simple(
     KeyAttr => {
         login       => '+id',
         institution => '+id',
-        service     => '+port'
+        service     => '+port',
     },
     GroupTags => {
         listeners    => 'service',
         accounts     => 'login',
         institutions => 'institution',
     },
-    ForceArray => [ 'service', 'login', 'institution' ],
+    ForceArray => [ 'service', 'login', 'institution', 'server' ],
     ValueAttr  => {
         'error-detect' => 'enabled',
         'timeout'      => 'value',
@@ -111,7 +111,7 @@ sub find_service {
         }
         push @misses, $portstr;
     }
-    Sys::Syslog::syslog("LOG_WARN", "find_service: No match in: " . join(' ',@misses));
+    Sys::Syslog::syslog("LOG_WARNING", "find_service: No match in: " . join(' ',@misses));
     return;
 }
 
